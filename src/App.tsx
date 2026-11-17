@@ -453,7 +453,10 @@ export default function App() {
       setUser(data.session?.user ?? null);
     });
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user ?? null);
+      setUser((current) => {
+        const nextUser = session?.user ?? null;
+        return current?.id === nextUser?.id ? current : nextUser;
+      });
     });
     return () => subscription.unsubscribe();
   }, []);
@@ -1204,7 +1207,7 @@ export default function App() {
                     onRequestReturn={requestOrderReturn}
                   />
                 )}
-                {tab === 'trustea' && <TrusteaPage />}
+                {tab === 'trustea' && <TrusteaPage user={user} onLogin={requireLogin} />}
                 {tab === 'pay' && (
                   <PayPage
                     user={user}

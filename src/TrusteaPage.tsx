@@ -1,4 +1,5 @@
 import { ChangeEvent, FormEvent, useCallback, useEffect, useState } from 'react';
+import type { User } from '@supabase/supabase-js';
 import {
   ArrowRight,
   Camera,
@@ -12,6 +13,7 @@ import {
   ShieldCheck,
   Truck,
 } from 'lucide-react';
+import { supabase } from './lib/supabase';
 import './trustea.css';
 
 type LocationChoice =
@@ -52,11 +54,13 @@ type TrusteaRecord = {
   seller_paid_at?: string | null;
 };
 
-type SavedTrusteaLink = { id: string; token: string };
+type SavedTrusteaLink = { id: string; token: string; role?: 'buyer' | 'seller' };
 
 const HUB_URL = (import.meta.env.VITE_HUB_URL || 'http://localhost:3001').replace(/\/+$/, '');
 const TRUSTEA_INBOX_KEY = 'sumthin_trustea_private_links';
 const stages = ['Seller details', 'Buyer checkout', 'MFI review', 'Fleetbase delivery', 'Receipt', 'Return window', 'Settlement'];
+
+type TrusteaPhoneFactor = { phone_id: string; phone: string };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${HUB_URL}/api/fulfilment${path}`, {
@@ -163,7 +167,7 @@ function LocationChooser({
   </div>;
 }
 
-export default function TrusteaPage() {
+export default function TrusteaPage({ user, onLogin }: { user: User | null; onLogin: () => boolean }) {
   const query = new URLSearchParams(window.location.search);
   const [transactionId, setTransactionId] = useState(query.get('transaction') || '');
   const [token, setToken] = useState(query.get('token') || '');
@@ -171,6 +175,14 @@ export default function TrusteaPage() {
   const [savedLinks, setSavedLinks] = useState<SavedTrusteaLink[]>([]);
   const [inboxTransactions, setInboxTransactions] = useState<Record<string, TrusteaRecord | null>>({});
   const [inboxReady, setInboxReady] = useState(false);
+  const [phoneFactorId, setPhoneFactorId] = useState('');
+  const [phoneFactorPhone, setPhoneFactorPhone] = useState('');
+  const [phoneEntry, setPhoneEntry] = useState('');
+  const [phoneCode, setPhoneCode] = useState('');
+  const [phoneChallengeId, setPhoneChallengeId] = useState('');
+  const [phoneVerified, setPhoneVerified] = useState(false);
+  const [securityLoading, setSecurityLoading] = useState(false);
+  const [securityWorking, setSecurityWorking] = useState(false);
   const [locations, setLocations] = useState<FulfilmentLocation[]>([]);
   const [insuranceRate, setInsuranceRate] = useState(2);
   const [loading, setLoading] = useState(Boolean(query.get('transaction') && query.get('token')));
@@ -178,7 +190,6 @@ export default function TrusteaPage() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [buyerName, setBuyerName] = useState('');
-  const [buyerPhone, setBuyerPhone] = useState('');
   const [sellerPhone, setSellerPhone] = useState('');
   const [sellerName, setSellerName] = useState('');
   const [description, setDescription] = useState('');
@@ -189,38 +200,120 @@ export default function TrusteaPage() {
   const [salaryConsent, setSalaryConsent] = useState(false);
   const [resumeLink, setResumeLink] = useState('');
 
+  const authHeaders = useCallback(async (): Promise<Record<string, string>> => {
+    if (!supabase) throw new Error('Supabase is not configured.');
+    const { data, error: sessionError } = await supabase.auth.getSession();
+    if (sessionError) throw sessionError;
+    const accessToken = data.session?.access_token;
+    if (!accessToken) throw new Error('Sign in again to continue.');
+    return {
+      Authorization: `Bearer ${accessToken}`,
+    };
+  }, []);
+
   const refresh = useCallback(async () => {
     if (!transactionId || !token) return;
     setTransaction(await fetchTransaction(transactionId, token));
   }, [transactionId, token]);
 
   useEffect(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(TRUSTEA_INBOX_KEY) || '[]') as SavedTrusteaLink[];
-      if (!Array.isArray(saved) || saved.some((link) =>
-        !link || typeof link.id !== 'string' || typeof link.token !== 'string')) {
-        throw new Error('Saved BuySafe inbox data is invalid.');
-      }
-      const current = query.get('transaction') && query.get('token')
-        ? [{ id: query.get('transaction')!, token: query.get('token')! }]
-        : [];
-      const links = [...current, ...saved].filter((link, index, all) =>
-        all.findIndex((candidate) => candidate.id === link.id && candidate.token === link.token) === index);
-      setSavedLinks(links);
-      setInboxReady(true);
-    } catch (cause) {
-      setError(cause instanceof Error ? `Could not load your saved BuySafe requests: ${cause.message}` : 'Could not load your saved BuySafe requests.');
+    let active = true;
+    setPhoneVerified(false);
+    setPhoneFactorId('');
+    setPhoneFactorPhone('');
+    setPhoneEntry('');
+    setPhoneChallengeId('');
+    setPhoneCode('');
+    setSavedLinks([]);
+    setInboxTransactions({});
+    setInboxReady(false);
+    if (!user || !supabase) {
+      setSecurityLoading(false);
+      return () => { active = false; };
     }
-  }, []);
+
+    setSecurityLoading(true);
+    const loadPhoneFactor = async () => {
+      const factor = await request<TrusteaPhoneFactor | null>('/phone-factor', {
+        headers: await authHeaders(),
+      });
+      if (active && factor) {
+        setPhoneFactorId(factor.phone_id);
+        setPhoneFactorPhone(factor.phone);
+        setPhoneEntry(factor.phone);
+        setPhoneVerified(true);
+      } else if (active) {
+        setPhoneEntry(user.phone || '');
+      }
+    };
+    void loadPhoneFactor().catch((cause: Error) => {
+      if (active) setError(`Could not check your BuySafe phone verification: ${cause.message}`);
+    }).finally(() => {
+      if (active) setSecurityLoading(false);
+    });
+    return () => { active = false; };
+  }, [authHeaders, user?.id]);
 
   useEffect(() => {
-    if (!inboxReady) return;
-    try {
-      localStorage.setItem(TRUSTEA_INBOX_KEY, JSON.stringify(savedLinks));
-    } catch (cause) {
-      setError(cause instanceof Error ? `Could not save your BuySafe inbox: ${cause.message}` : 'Could not save your BuySafe inbox.');
+    if (!phoneVerified || !phoneFactorId || !user || !supabase) {
+      setSavedLinks([]);
+      setInboxReady(false);
+      return;
     }
-  }, [inboxReady, savedLinks]);
+    let active = true;
+    const loadAccountInbox = async () => {
+      const headers = await authHeaders();
+
+      const legacyLinks: SavedTrusteaLink[] = [];
+      try {
+        const saved = JSON.parse(localStorage.getItem(TRUSTEA_INBOX_KEY) || '[]') as SavedTrusteaLink[];
+        if (!Array.isArray(saved) || saved.some((link) =>
+          !link || typeof link.id !== 'string' || typeof link.token !== 'string')) {
+          throw new Error('Saved BuySafe links are invalid.');
+        }
+        legacyLinks.push(...saved);
+      } catch (cause) {
+        setError(cause instanceof Error ? `Could not import old BuySafe links: ${cause.message}` : 'Could not import old BuySafe links.');
+      }
+      const currentId = query.get('transaction');
+      const currentToken = query.get('token');
+      if (currentId && currentToken) legacyLinks.push({ id: currentId, token: currentToken });
+      const uniqueLinks = legacyLinks.filter((link, index, all) =>
+        all.findIndex((candidate) => candidate.id === link.id && candidate.token === link.token) === index);
+      const failedLinks: SavedTrusteaLink[] = uniqueLinks.slice(100);
+      for (const link of uniqueLinks.slice(0, 100)) {
+        try {
+          await request(`/transactions/${encodeURIComponent(link.id)}/link`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ token: link.token }),
+          });
+        } catch {
+          failedLinks.push(link);
+        }
+      }
+      if (uniqueLinks.length > 0) {
+        if (failedLinks.length) {
+          localStorage.setItem(TRUSTEA_INBOX_KEY, JSON.stringify(failedLinks));
+          setError(`${failedLinks.length} old BuySafe link${failedLinks.length === 1 ? '' : 's'} could not be linked to this phone. They remain saved in this browser.`);
+        } else {
+          localStorage.removeItem(TRUSTEA_INBOX_KEY);
+        }
+      }
+
+      const links = await request<SavedTrusteaLink[]>('/transactions/inbox', {
+        headers,
+      });
+      if (active) {
+        setSavedLinks(links);
+        setInboxReady(true);
+      }
+    };
+    void loadAccountInbox().catch((cause: Error) => {
+      if (active) setError(`Could not load your saved BuySafe requests: ${cause.message}`);
+    });
+    return () => { active = false; };
+  }, [authHeaders, phoneVerified, phoneFactorId, user?.id]);
 
   useEffect(() => {
     if (!inboxReady || savedLinks.length === 0) return;
@@ -304,24 +397,89 @@ export default function TrusteaPage() {
     }
   };
 
+  const sendPhoneCode = async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    if (!supabase || !user) {
+      onLogin();
+      return;
+    }
+    setSecurityWorking(true);
+    setError('');
+    setNotice('');
+    try {
+      const phone = (phoneFactorId ? phoneFactorPhone : phoneEntry).trim().replace(/[ ()-]/g, '');
+      if (!/^\+[1-9]\d{7,14}$/.test(phone)) {
+        throw new Error('Enter your phone in international format, for example +260XXXXXXXXX.');
+      }
+      const challenge = await request<{ challenge_id: string; phone: string }>('/phone-factor/challenge', {
+        method: 'POST',
+        headers: await authHeaders(),
+        body: JSON.stringify({ phone }),
+      });
+      setPhoneChallengeId(challenge.challenge_id);
+      setPhoneFactorPhone(challenge.phone);
+      setPhoneEntry(challenge.phone);
+      setNotice(`A verification code was sent to ${challenge.phone}.`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not send the BuySafe verification code.');
+    } finally {
+      setSecurityWorking(false);
+    }
+  };
+
+  const verifyPhoneCode = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!supabase || !phoneChallengeId) return;
+    setSecurityWorking(true);
+    setError('');
+    setNotice('');
+    try {
+      const code = phoneCode.trim();
+      if (!code) throw new Error('Enter the verification code sent to your phone.');
+      const verified = await request<TrusteaPhoneFactor>('/phone-factor/verify', {
+        method: 'POST',
+        headers: await authHeaders(),
+        body: JSON.stringify({ challenge_id: phoneChallengeId, code }),
+      });
+      setPhoneFactorId(verified.phone_id);
+      setPhoneFactorPhone(verified.phone);
+      setPhoneVerified(true);
+      setPhoneCode('');
+      setNotice('Phone verified and saved to your Trustea account.');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'That verification code could not be confirmed.');
+    } finally {
+      setSecurityWorking(false);
+    }
+  };
+
   const beginTransaction = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (!user || !supabase || !phoneVerified) {
+      setError('Sign in and verify your phone before starting a BuySafe transaction.');
+      return;
+    }
     setWorking(true);
     setError('');
     setNotice('');
     try {
       const created = await request<{ transaction_id: string; buyer_url: string }>('/transactions', {
         method: 'POST',
-        body: JSON.stringify({ buyer_name: buyerName, buyer_phone: buyerPhone, seller_phone: sellerPhone }),
+        headers: await authHeaders(),
+        body: JSON.stringify({
+          buyer_name: buyerName,
+          seller_phone: sellerPhone,
+        }),
       });
       const buyerToken = new URL(created.buyer_url).searchParams.get('token');
       if (!buyerToken) throw new Error('BuySafe created the transaction but returned no buyer access link.');
       setSavedLinks((previous) => [{ id: created.transaction_id, token: buyerToken }, ...previous.filter((link) => link.id !== created.transaction_id)]);
+      setInboxReady(true);
       updateLink(created.transaction_id, buyerToken);
       setTransactionId(created.transaction_id);
       setToken(buyerToken);
       setTransaction(await fetchTransaction(created.transaction_id, buyerToken));
-      setNotice('Private transaction created. The seller has been invited by SMS.');
+      setNotice('The transaction is saved to your BuySafe inbox, and the seller has been invited by SMS.');
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Could not invite the seller.');
     } finally {
@@ -329,7 +487,7 @@ export default function TrusteaPage() {
     }
   };
 
-  const resumeTransaction = (event: FormEvent<HTMLFormElement>) => {
+  const resumeTransaction = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     try {
       const supplied = new URL(resumeLink.trim(), window.location.origin);
@@ -338,10 +496,24 @@ export default function TrusteaPage() {
       if (!id || !accessToken) throw new Error('Paste a complete private BuySafe transaction link.');
       setError('');
       setNotice('');
-      setSavedLinks((previous) => [{ id, token: accessToken }, ...previous.filter((link) => link.id !== id)]);
       updateLink(id, accessToken);
       setTransactionId(id);
       setToken(accessToken);
+      if (user && supabase && phoneVerified) {
+        await request(`/transactions/${encodeURIComponent(id)}/link`, {
+          method: 'POST',
+          headers: await authHeaders(),
+          body: JSON.stringify({ token: accessToken }),
+        });
+        const inbox = await request<SavedTrusteaLink[]>('/transactions/inbox', {
+          headers: await authHeaders(),
+        });
+        setSavedLinks(inbox);
+        setInboxReady(true);
+        setNotice('This request is linked to your verified account and saved in your BuySafe inbox.');
+      } else {
+        setNotice('Request opened. Verify your account’s phone number to save it to your BuySafe inbox.');
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Enter a valid private BuySafe link.');
     }
@@ -436,16 +608,6 @@ export default function TrusteaPage() {
     setTransactionId(link.id);
     setToken(link.token);
   };
-  const forgetTransaction = (id: string) => {
-    setSavedLinks((previous) => previous.filter((link) => link.id !== id));
-    setInboxTransactions((previous) => {
-      const next = { ...previous };
-      delete next[id];
-      return next;
-    });
-    if (transactionId === id) showInbox();
-  };
-
   return <div className="page-wrap trustea-page">
     <div className="page-title-block">
       <div className="eyebrow">BUYSAFE · PRIVATE TRANSACTIONS</div>
@@ -456,36 +618,61 @@ export default function TrusteaPage() {
     {notice && <div className="trustea-message success" role="status"><CheckCircle2 size={17} />{notice}</div>}
 
     {loading && <div className="trustea-card trustea-loading"><RefreshCw size={17} />Loading your private transaction…</div>}
-    {savedLinks.length > 0 && <section className="trustea-card trustea-inbox">
-      <div className="trustea-inbox-heading"><div><h2>My BuySafe requests</h2><p className="trustea-muted">Switch between your buyer and seller transactions on this device.</p></div><span className="trustea-inbox-count">{savedLinks.length}</span></div>
+    {isNew && !user && <section className="trustea-card trustea-security">
+      <h2>Sign in to use BuySafe</h2>
+      <p className="trustea-muted">Sign in to verify your phone by SMS and keep your BuySafe requests in your account inbox.</p>
+      <button className="button button-dark" type="button" onClick={onLogin}>Log in <ArrowRight size={15} /></button>
+    </section>}
+    {isNew && user && securityLoading && <div className="trustea-card trustea-loading"><RefreshCw size={17} />Checking your verified phone…</div>}
+    {user && !securityLoading && !phoneVerified && <div className="trustea-card trustea-security">
+      <h2>Verify your phone</h2>
+      <p className="trustea-muted">BuySafe sends a one-time code to verify and save a phone number to your Trustea account. Your verified status stays with this account across devices and sign-ins.</p>
+      {!phoneChallengeId && <form onSubmit={sendPhoneCode}>
+        {!phoneFactorId
+          ? <label>Phone number<input type="tel" value={phoneEntry} onChange={(event) => setPhoneEntry(event.target.value)} placeholder="+260XXXXXXXXX" autoComplete="tel" required /></label>
+          : <p className="trustea-muted">Code destination: {phoneFactorPhone || 'your verified phone'}</p>}
+        <button className="button button-dark" disabled={securityWorking}>{securityWorking ? 'Sending code…' : phoneFactorId ? 'Send verification code' : 'Set up phone and send code'} <ArrowRight size={15} /></button>
+      </form>}
+      {phoneChallengeId && <form onSubmit={verifyPhoneCode}>
+        <p className="trustea-muted">Enter the code sent to {phoneFactorPhone || 'your verified phone'}.</p>
+        <label>SMS verification code<input inputMode="numeric" autoComplete="one-time-code" value={phoneCode} onChange={(event) => setPhoneCode(event.target.value)} maxLength={12} required /></label>
+        <div className="trustea-fields two">
+          <button className="button button-dark" disabled={securityWorking}>{securityWorking ? 'Verifying…' : 'Verify phone'} <CheckCircle2 size={15} /></button>
+          <button className="button button-outline" type="button" disabled={securityWorking} onClick={() => void sendPhoneCode()}>Resend code</button>
+        </div>
+      </form>}
+    </div>}
+    {user && phoneVerified && !inboxReady && <div className="trustea-card trustea-loading"><RefreshCw size={17} />Loading your secure BuySafe inbox…</div>}
+    {user && phoneVerified && inboxReady && <section className="trustea-card trustea-inbox">
+      <div className="trustea-inbox-heading"><div><h2>My BuySafe requests</h2><p className="trustea-muted">Your requests are saved to your Trustea account and available across devices.</p></div><span className="trustea-inbox-count">{savedLinks.length}</span></div>
+      {savedLinks.length === 0 && <p className="trustea-muted">No linked BuySafe requests yet. Start a protected transaction or open a private link to add one.</p>}
       <div className="trustea-inbox-list">{savedLinks.map((link) => {
         const record = inboxTransactions[link.id];
         const current = transactionId === link.id && token === link.token;
-        return <article className={`trustea-inbox-item ${current ? 'selected' : ''}`} key={`${link.id}:${link.token}`}>
+        return <article className={`trustea-inbox-item ${current ? 'selected' : ''}`} key={link.id}>
           <button type="button" className="trustea-inbox-open" onClick={() => selectTransaction(link)}>
             <strong>{record?.item_description || `Request ${link.id.slice(0, 8).toUpperCase()}`}</strong>
             <span>{record ? `${record.role === 'buyer' ? 'Buying' : 'Selling'} · ${statusLabel(record.status)}` : Object.prototype.hasOwnProperty.call(inboxTransactions, link.id) ? 'Could not load this request; reopen its private link to retry.' : 'Checking request status…'}</span>
           </button>
-          <button type="button" className="trustea-inbox-forget" onClick={() => forgetTransaction(link.id)} aria-label={`Forget request ${link.id.slice(0, 8)}`}>Forget</button>
         </article>;
       })}</div>
-      <p className="trustea-muted trustea-inbox-note">Private links are saved only in this browser. Sellers can add each buyer request by opening its BuySafe SMS link here. Forgetting a request removes it from this device but does not cancel the transaction.</p>
+      <p className="trustea-muted trustea-inbox-note">Participant access tokens are encrypted by the Trustea service and are returned only to your signed-in account after you verify its phone number. Opening a browser link does not cancel the transaction.</p>
     </section>}
     {isNew && !loading && <div className="trustea-grid">
-      <form className="trustea-card" onSubmit={beginTransaction}>
+      {user && phoneVerified && <form className="trustea-card" onSubmit={beginTransaction}>
         <h2>Start a protected transaction</h2>
         <p className="trustea-muted">Invite the seller by SMS. They’ll enter item information and a pickup location using their private link.</p>
         <div className="trustea-fields two">
           <label>Your name<input value={buyerName} onChange={(event) => setBuyerName(event.target.value)} maxLength={100} required /></label>
-          <label>Your mobile number<input type="tel" value={buyerPhone} onChange={(event) => setBuyerPhone(event.target.value)} maxLength={20} required /></label>
+          {phoneFactorPhone && <p className="trustea-muted">Verified phone: {phoneFactorPhone}</p>}
         </div>
         <label>Seller’s mobile number<input type="tel" value={sellerPhone} onChange={(event) => setSellerPhone(event.target.value)} maxLength={20} required /></label>
         <button className="button button-dark" disabled={working}>{working ? 'Creating private link…' : 'Invite seller'} <ArrowRight size={15} /></button>
         <p className="trustea-muted">The seller does not receive your phone number or delivery address.</p>
-      </form>
+      </form>}
       <form className="trustea-card" onSubmit={resumeTransaction}>
         <h2>Open an existing transaction</h2>
-        <p className="trustea-muted">Use the private link sent by BuySafe SMS or saved when you started the transaction.</p>
+        <p className="trustea-muted">Use the private link sent by BuySafe SMS. Sign in and verify your account’s phone number once to add requests to your persistent inbox.</p>
         <label>Private transaction link<input value={resumeLink} onChange={(event) => setResumeLink(event.target.value)} placeholder="Paste your BuySafe link" required /></label>
         <button className="button button-outline">Open transaction <ArrowRight size={15} /></button>
         <div className="trustea-privacy"><ShieldCheck size={18} />Anyone with the private link can access that participant’s transaction. Keep it confidential.</div>
